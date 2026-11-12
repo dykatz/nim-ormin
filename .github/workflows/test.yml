@@ -3,7 +3,44 @@ name: CI
 on: [push, pull_request]
 
 jobs:
-  build:
+  sqlite:
+    name: Test SQLite and build examples
+    runs-on: ubuntu-latest
+    steps:
+    - name: Checkout source code
+      uses: actions/checkout@v4
+
+    - name: Setup nim
+      uses: jiro4989/setup-nim-action@v2
+      with:
+        nim-version: stable
+
+    - name: Install Atlas
+      shell: bash
+      env:
+        ATLAS_INSTALL_DIR: ${{ runner.temp }}/atlas/bin
+      run: |
+        curl -fsSL --retry 3 \
+          https://raw.githubusercontent.com/nim-lang/atlas/HEAD/install.sh | bash
+        echo "$ATLAS_INSTALL_DIR" >> "$GITHUB_PATH"
+
+    - name: Cache dependencies
+      uses: actions/cache@v4
+      with:
+        path: deps/
+        key: atlas-examples-${{ runner.os }}-${{ hashFiles('ormin.nimble') }}
+
+    - name: Install dependencies
+      run: atlas install -uk --feature:examples
+
+    - name: Run test sqlite
+      run: nim test
+
+    - name: Build examples
+      run: nim buildexamples
+
+  postgres:
+    name: Test PostgreSQL 14
     runs-on: ubuntu-latest
 
     services:
@@ -21,11 +58,6 @@ jobs:
         ports:
           - 5432:5432
 
-    strategy:
-      matrix:
-        nim:
-          - stable
-    name: Test on nim ${{ matrix.nim }}
     steps:
     - name: Checkout source code
       uses: actions/checkout@v4
@@ -33,7 +65,7 @@ jobs:
     - name: Setup nim
       uses: jiro4989/setup-nim-action@v2
       with:
-        nim-version: ${{ matrix.nim }}
+        nim-version: stable
 
     - name: Install Atlas
       shell: bash
@@ -48,21 +80,15 @@ jobs:
       uses: actions/cache@v4
       with:
         path: deps/
-        key: atlas-${{ runner.os }}-${{ hashFiles('ormin.nimble') }}
+        key: atlas-postgres-${{ runner.os }}-${{ hashFiles('ormin.nimble') }}
 
     - name: Install dependencies
-      run: atlas install -uk --feature:examples
-      
-    - name: Run test sqlite
-      run: nim test
+      run: atlas install -uk
 
     - name: Run test postgres
       run: nim test_postgres
       env:
         PGPASSWORD: test
-
-    - name: Build examples
-      run: nim buildexamples
 
   mysql:
     runs-on: ubuntu-latest
