@@ -18,13 +18,12 @@ Features:
 TODO:
 
 - Better support for complex nested queries.
-- Write mysql backend.
 
 
 ## Schema and Database Setup
 
 1. **Generate a model from SQL** – Place your schema in an `.sql` file and import it using `importModel`. By default this runs `ormin_importer` and includes the generated Nim code. Pass `includeStatic = true` to generate the model directly at compile time from the SQL file instead.
-2. **Create a database connection** – Ormin expects a global connection named `db` when issuing queries. The library ships drivers for SQLite and PostgreSQL; pick the matching backend in `importModel` and open a connection with Nim's database modules.
+2. **Create a database connection** – Ormin expects a connection named `db` when issuing queries. The library ships drivers for SQLite, PostgreSQL, and MySQL/MariaDB; pick the matching backend in `importModel` and open a connection.
 
 ### Static Schema
 
@@ -69,6 +68,47 @@ import ../ormin
 importModel(DbBackend.postgre, "model_postgre")
 let db {.global.} = open("localhost", "user", "password", "dbname")
 ```
+
+### MySQL / MariaDB
+
+Use `DbBackend.mysql` for both servers. The common feature baseline targets MySQL 8.4+ and MariaDB 11.4+; CI covers those versions.
+
+Install the client development headers and libraries first (for example, `default-libmysqlclient-dev` or `libmariadb-dev-compat` on Debian/Ubuntu, or `mariadb` with Homebrew). The compiler uses `mysql_config` for compiler/linker flags. If necessary, pass `-d:mysqlConfig=/path/to/mariadb_config`.
+
+```nim
+import std/os
+import ormin
+importModel(DbBackend.mysql, "model_mysql", includeStatic = true)
+
+let db = open("127.0.0.1:3306", "myuser", getEnv("MYSQL_PASSWORD"), "mydatabase")
+# Alternatively, the connection argument can be an absolute Unix socket path:
+# let db = open("/path/to/mysql.sock", "myuser", getEnv("MYSQL_PASSWORD"), "mydatabase")
+defer: close(db)
+```
+
+Both model import paths support `AUTO_INCREMENT`, unsigned integers, inline enums, named indexes, primary/foreign keys, and backtick identifiers. Schema utilities preserve type sizes, engine, charset, and collation options. Use SQL schema files, not complete database dumps with client commands, routines, or triggers.
+
+Connections use `utf8mb4` and UTC (`time_zone = '+00:00'`). Use strict server SQL mode to reject invalid/truncated values. Temporal parameters are converted to UTC; `DATETIME` is treated as a UTC wall-clock value. `DATETIME`/`TIMESTAMP` support microseconds and reject invalid/zero dates when decoding. `DATE` and `TIME` are strings because MySQL `TIME` also represents durations.
+
+MySQL-specific behavior:
+
+| Feature | Behavior |
+| --- | --- |
+| Prepared CRUD, joins, CTEs, windows, set operations | Supported on the baseline versions |
+| Integer results | Signed `int64`; unsigned `uint64` |
+| `DECIMAL` / `NUMERIC` | Exact decimal strings, not floats |
+| `BOOLEAN` / `BOOL` | Nim `bool`; `TINYINT(1)` remains an integer |
+| JSON | `JsonNode`; SQL NULL is separate from a JSON document containing `null` |
+| `produce json` with unsigned integers | Values beyond `high(int64)` raise rather than losing precision |
+| `returning column` | Only an auto-increment column; uses the statement insert-ID API, not a second SQL statement. Omit the ID from the insert to request a generated value. Arbitrary returned columns and MariaDB-native `RETURNING` are not supported. |
+| `onconflict` upserts | Rejected at compile time: MySQL's `ON DUPLICATE KEY UPDATE` cannot honor a selected conflict target |
+| Full outer joins | Rejected at compile time |
+| `ilike` | Emulated with `lower(lhs) like lower(rhs)`; matching remains subject to server collation rules |
+| `BIT`, `SET`, spatial and other unmapped types | Rejected when used in a query |
+
+Transactions and nested savepoints require InnoDB (or another transactional engine). DDL can implicitly commit and must not be assumed to roll back. Transaction nesting is tracked separately for each connection on each thread; do not share an active connection across threads.
+
+The backend exports `exec(db, sql"...")` and `getValue(db, sql"...")` for single, unparameterized SQL statements. Prefer the query DSL for runtime values. `DbConn` is compatible with `db_connector/db_mysql`, but that module's separate dynamic loader may require additional library-path configuration on some systems.
 
 ## Query DSL
 
@@ -391,7 +431,7 @@ transaction:
   # Continue outer transaction normally
 ```
 
-PostgreSQL and SQLite are supported. The macros use `BEGIN/COMMIT/ROLLBACK` for the outermost transaction and `SAVEPOINT/RELEASE/ROLLBACK TO` for nested scopes. 
+PostgreSQL, SQLite, and MySQL/MariaDB are supported. The macros use backend-appropriate transaction start syntax, `COMMIT/ROLLBACK`, and `SAVEPOINT/RELEASE/ROLLBACK TO` for nested scopes.
 
 ## Reusable Procedures and Iterators
 
@@ -459,6 +499,10 @@ Run the full test suite via Nimble:
 ```bash
 nimble test
 ```
+
+For MySQL/MariaDB, create a disposable `ormin_test` database and a user with privileges on that database only. Run `nim test_mysql` (or `nimble test_mysql`). The tests create and drop their `ormin_mysql_*` fixture tables; never point them at real application data.
+
+Supply `MYSQL_DATABASE=ormin_test`, `MYSQL_USER`, `MYSQL_PASSWORD`, and either `MYSQL_SOCKET` or `MYSQL_HOST`/`MYSQL_PORT` through the environment or an ignored `.ormin-test.env` file. Set `ORMIN_MYSQL_ENV` to use another file. Environment values take precedence. The runner does not log credentials. Additional compiler flags can be passed with `python3 tools/test_mysql.py -d:release`.
 
 ## License
 

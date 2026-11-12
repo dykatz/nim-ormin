@@ -6,7 +6,7 @@ description = "Prepared SQL statement generator. A lightweight ORM."
 license       = "MIT"
 bin = @["tools/ormin_importer"]
 skipDirs = @["examples"]
-installExt = @["nim"]
+installExt = @["nim", "h"]
 
 # Dependencies
 requires "nim >= 2.0.0"
@@ -20,4 +20,3 @@ feature "examples":
 import std/os
 when fileExists("config.nims"):
   include "config.nims"
-

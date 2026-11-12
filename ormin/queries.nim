@@ -5,7 +5,7 @@ when not declared(tableNames):
 when not declared(attributes):
   {.macros.error: "The query DSL requires a attributes const.".}
 
-import macros, strutils
+import macros, strutils, tables
 import db_connector/db_common
 from os import parentDir, `/`
 
@@ -169,7 +169,7 @@ template execNoRowsStrict*(sqlStmt: string) =
     when defined(debugOrminTrace):
       echo "[[Ormin Executing]]: ", sqlStmt
     let s {.gensym.} = prepareStmt(db, sqlStmt)
-    when dbBackend == DbBackend.sqlite:
+    when dbBackend in {DbBackend.sqlite, DbBackend.mysql}:
       defer: finalizeStmt(s)
     startQuery(db, s)
     if stepQuery(db, s, false):
@@ -184,7 +184,7 @@ template execNoRowsLoose(sqlStmt: string) =
     when defined(debugOrminTrace):
       echo "[[Ormin Executing]]: ", sqlStmt
     let s {.gensym.} = prepareStmt(db, sqlStmt)
-    when dbBackend == DbBackend.sqlite:
+    when dbBackend in {DbBackend.sqlite, DbBackend.mysql}:
       defer: finalizeStmt(s)
     startQuery(db, s)
     discard stepQuery(db, s, false)
@@ -203,7 +203,10 @@ proc newQueryBuilder(): QueryBuilder {.compileTime.} =
     onConflictIsDoUpdate: false, onConflictWhereSet: false)
 
 proc getAlias(q: QueryBuilder; tabIndex: int): string =
-  result = tableNames[tabIndex][0] & $q.aliasGen
+  when dbBackend == DbBackend.mysql:
+    result = "t" & $q.aliasGen
+  else:
+    result = tableNames[tabIndex][0] & $q.aliasGen
   inc q.aliasGen
 
 proc placeholder(q: QueryBuilder): string =
@@ -326,6 +329,8 @@ proc lookup(table: openArray[string], name: string): int =
     if cmpIgnoreCase(t, name) == 0:
       return i
 
+proc escIdent(dest: var string; src: string)
+
 proc autoJoin(join: var string, src: (int, string), dest: int;
               destAlias: string): bool =
   var srcCol = -1
@@ -341,11 +346,11 @@ proc autoJoin(join: var string, src: (int, string), dest: int;
     join.add " on "
     join.add destAlias
     join.add "."
-    join.add attributes[destCol].name
+    escIdent(join, attributes[destCol].name)
     join.add equals
     join.add src[1]
     join.add "."
-    join.add attributes[srcCol].name
+    escIdent(join, attributes[srcCol].name)
     result = true
 
 proc `$`(a: DbType): string = $a.kind
@@ -367,16 +372,27 @@ proc checkCompatibleSet(a, b: DbType; n: NimNode) =
   discard "too implement; might require a richer type system"
 
 proc toNimType(t: DbTypeKind): NimNode {.compileTime.} =
+  when dbBackend == DbBackend.mysql:
+    if t notin {dbVarchar, dbFixedChar, dbEnum, dbDecimal, dbBlob, dbInt, dbUInt,
+                dbSerial, dbFloat, dbBool, dbTimestamp, dbDateTime, dbDate, dbTime, dbJson}:
+      macros.error "unsupported MySQL/MariaDB column type: " & $t
   let name = ($t).substr(2).toLowerAscii & "Type"
   result = ident(name)
 
 proc toNimType(t: DbType): NimNode {.compileTime.} = toNimType(t.kind)
 
 proc escIdent(dest: var string; src: string) =
-  if allCharsInSet(src, {'\33'..'\127'}):
-    dest.add(src)
+  when dbBackend == DbBackend.mysql:
+    var first = true
+    for part in src.split('.'):
+      if not first: dest.add '.'
+      dest.add("`" & part.replace("`", "``") & "`")
+      first = false
   else:
-    dest.add("\"" & replace(src, "\"", "\"\"") & "\"")
+    if allCharsInSet(src, {'\33'..'\127'}):
+      dest.add(src)
+    else:
+      dest.add("\"" & replace(src, "\"", "\"\"") & "\"")
 
 proc fmtTableList(tableNames: openArray[string]): string =
   result = ""
@@ -516,8 +532,8 @@ proc renderWindowClause(n: NimNode; q: var string; params: var Params;
 
 proc lookupColumnInEnv(n: NimNode; q: var string; params: var Params;
                       expected: DbType, qb: QueryBuilder): DbType =
-  expectKind(n, nnkIdent)
-  let name = $n
+  let name = nodeName(n)
+  if name.len == 0: macros.error "expected column identifier", n
   block checkAliases:
     for a in qb.colAliases:
       if cmpIgnoreCase(a[0], name) == 0:
@@ -536,8 +552,8 @@ proc lookupColumnInEnv(n: NimNode; q: var string; params: var Params;
 proc cond(n: NimNode; q: var string; params: var Params;
           expected: DbType, qb: QueryBuilder): DbType =
   case n.kind
-  of nnkIdent:
-    let name = $n
+  of nnkIdent, nnkAccQuoted:
+    let name = nodeName(n)
     if name == "_":
       q.add "*"
       result = DbType(kind: dbUnknown)
@@ -549,10 +565,16 @@ proc cond(n: NimNode; q: var string; params: var Params;
   of nnkDotExpr:
     let t = nodeName(n[0])
     let a = nodeName(n[1])
-    escIdent(q, t)
+    when dbBackend == DbBackend.mysql:
+      var alias: string
+      result = lookup(t, a, qb, alias)
+      if result.kind == dbUnknown: macros.error "unknown or ambiguous column: " & t & "." & a, n
+      escIdent(q, if qb.kind in {qkSelect, qkJoin}: alias else: sourceName(qb, sourceLookup(qb, t)))
+    else:
+      escIdent(q, t)
+      result = lookup(t, a, qb)
     q.add '.'
     escIdent(q, a)
-    result = lookup(t, a, qb)
   of nnkPar, nnkStmtListExpr:
     if n.len == 1:
       q.add "("
@@ -580,7 +602,14 @@ proc cond(n: NimNode; q: var string; params: var Params;
     if result.kind == dbUnknown:
       # macros.error "cannot infer the type of the literal", n
       result.kind = dbVarchar
-    if result.kind == dbBlob:
+    if dbBackend == DbBackend.mysql:
+      # Hex text is independent of NO_BACKSLASH_ESCAPES and preserves NULs.
+      if result.kind != dbBlob: q.add "convert("
+      q.add "X'"
+      for c in n.strVal: q.add toHex(ord(c), 2)
+      q.add "'"
+      if result.kind != dbBlob: q.add " using utf8mb4)"
+    elif result.kind == dbBlob:
       # For SQL string literals, single quotes must be doubled.
       # Using strutils.escape would introduce backslashes which are
       # not valid escapes in standard SQL/SQLite. So replace `'` with `''`.
@@ -784,7 +813,7 @@ proc cond(n: NimNode; q: var string; params: var Params;
         if env.len == 2:
           qb.env = @[env[0]]
         let a =
-          if op == "ilike" and dbBackend == DbBackend.sqlite:
+          if op == "ilike" and dbBackend in {DbBackend.sqlite, DbBackend.mysql}:
             q.add "lower("
             let t = cond(n[0], q, params, DbType(kind: dbUnknown), qb)
             q.add ")"
@@ -792,7 +821,7 @@ proc cond(n: NimNode; q: var string; params: var Params;
           else:
             cond(n[0], q, params, DbType(kind: dbUnknown), qb)
         q.add " "
-        if op == "ilike" and dbBackend != DbBackend.sqlite:
+        if op == "ilike" and dbBackend == DbBackend.postgre:
           q.add "ilike"
         else:
           q.add "like"
@@ -800,7 +829,7 @@ proc cond(n: NimNode; q: var string; params: var Params;
         if env.len == 2:
           qb.env = @[env[1]]
         let b =
-          if op == "ilike" and dbBackend == DbBackend.sqlite:
+          if op == "ilike" and dbBackend in {DbBackend.sqlite, DbBackend.mysql}:
             q.add "lower("
             let t = cond(n[1][1], q, params, a, qb)
             q.add ")"
@@ -817,7 +846,7 @@ proc cond(n: NimNode; q: var string; params: var Params;
     macros.error "construct not supported in condition: " & treeRepr n, n
 
 proc addStatementCleanup(body, statement: NimNode) =
-  when dbBackend == DbBackend.sqlite:
+  when dbBackend in {DbBackend.sqlite, DbBackend.mysql}:
     body.add quote do:
       defer: finalizeStmt(`statement`)
 
@@ -851,6 +880,8 @@ proc generateRoutine(name: NimNode, q: QueryBuilder;
     finalParams.add newIdentDefs(ident"db", newTree(nnkDotExpr, ident"ormin_postgre", ident"DbConn"))
   elif dbBackend == DbBackend.sqlite:
     finalParams.add newIdentDefs(ident"db", newTree(nnkDotExpr, ident"ormin_sqlite", ident"DbConn"))
+  elif dbBackend == DbBackend.mysql:
+    finalParams.add newIdentDefs(ident"db", newTree(nnkDotExpr, ident"ormin_mysql", ident"DbConn"))
   else:
     finalParams.add newIdentDefs(ident"db", ident("DbConn"))
   var i = 1
@@ -907,8 +938,8 @@ proc getColumnName(n: NimNode): string =
     if n.len == 1: result = getColumnName(n[0])
   of nnkInfix:
     if $n[0] == "as": result = getColumnName(n[2])
-  of nnkIdent, nnkSym:
-    result = $n
+  of nnkIdent, nnkSym, nnkAccQuoted:
+    result = nodeName(n)
   else:
     # this is a little hacky, if the column name starts with
     # a space, it means "could not extract the column name"
@@ -976,10 +1007,10 @@ proc tableSel(n: NimNode; q: QueryBuilder) =
       return
     let alias = sourceAlias(q, tabIndex, tab)
     if q.kind == qkSelect:
-      escIdent(q.fromm, tab)
+      escIdent(q.fromm, sourceName(q, tabIndex))
       q.fromm.add " as " & alias
     elif q.kind != qkJoin:
-      escIdent(q.head, tab)
+      escIdent(q.head, sourceName(q, tabIndex))
     if q.kind == qkUpdate: q.head.add " set "
     elif q.kind notin {qkSelect, qkJoin}: q.head.add "("
 
@@ -988,7 +1019,7 @@ proc tableSel(n: NimNode; q: QueryBuilder) =
     for i in 1..<call.len:
       let col = call[i]
       if col.kind == nnkExprEqExpr and q.kind in {qkInsert, qkInsertReturning, qkUpdate, qkReplace}:
-        let colname = $col[0]
+        let colname = nodeName(col[0])
         if colname == "_":
           selectAll(q, tabIndex, col[1], col)
         else:
@@ -1036,8 +1067,8 @@ proc tableSel(n: NimNode; q: QueryBuilder) =
         if q.coln > 0: q.head.add ", "
         inc q.coln
         let t =
-          if col.kind in {nnkIdent, nnkSym}:
-            let colname = $col
+          if col.kind in {nnkIdent, nnkSym, nnkAccQuoted}:
+            let colname = nodeName(col)
             var typ = DbType(kind: dbUnknown)
             for srcCol in sourceColumns(q, tabIndex):
               if cmpIgnoreCase(srcCol.name, colname) == 0:
@@ -1064,7 +1095,7 @@ proc tableSel(n: NimNode; q: QueryBuilder) =
       return
     if isCteEnvIndex(tabIndex):
       macros.error "cannot delete from a CTE", n
-    escIdent(q.head, tab)
+    escIdent(q.head, sourceName(q, tabIndex))
     q.env.add((tabindex, q.getAlias(tabIndex)))
   elif n.kind == nnkRStrLit:
     q.head.add n.strVal
@@ -1175,6 +1206,9 @@ proc queryh(n: NimNode; q: QueryBuilder) =
       checkBool(t, n)
   of "join", "innerjoin", "outerjoin", "leftjoin", "leftouterjoin",
       "rightjoin", "rightouterjoin", "fulljoin", "fullouterjoin", "crossjoin":
+    when dbBackend == DbBackend.mysql:
+      if kind in ["fulljoin", "fullouterjoin", "outerjoin"]:
+        macros.error "MySQL/MariaDB do not support FULL OUTER JOIN", n
     q.join.add "\L" & joinKeyword(kind)
     expectLen n, 2
     let joinClause = n[1]
@@ -1189,7 +1223,7 @@ proc queryh(n: NimNode; q: QueryBuilder) =
       if tabIndex < 0:
         macros.error "unknown table name: " & tab & " from: " & fmtTableList(tableNames), n
       else:
-        escIdent(q.join, tab)
+        escIdent(q.join, sourceName(q, tabIndex))
         let alias = sourceAlias(q, tabIndex, tab)
         q.join.add " as " & alias
         var oldEnv = q.env
@@ -1212,7 +1246,7 @@ proc queryh(n: NimNode; q: QueryBuilder) =
       else:
         if kind == "crossjoin":
           let alias = sourceAlias(q, tabIndex, tab)
-          escIdent(q.join, tab)
+          escIdent(q.join, sourceName(q, tabIndex))
           q.join.add " as " & alias
           var oldEnv = q.env
           q.env = @[(tabIndex, alias)]
@@ -1224,7 +1258,7 @@ proc queryh(n: NimNode; q: QueryBuilder) =
           if isCteEnvIndex(tabIndex) or isCteEnvIndex(q.env[^1][0]):
             macros.error "automatic joins are only supported for base tables", n
           let alias = q.getAlias(tabIndex)
-          escIdent(q.join, tab)
+          escIdent(q.join, sourceName(q, tabIndex))
           q.join.add " as " & alias
           if not autoJoin(q.join, q.env[^1], tabIndex, alias):
             macros.error "cannot compute auto join from: " & tableNames[q.env[^1][0]] & " to: " & tab, n
@@ -1257,6 +1291,8 @@ proc queryh(n: NimNode; q: QueryBuilder) =
     let t = cond(n[1], q.offset, q.params, DbType(kind: dbInt), q)
     checkInt(t, n[1])
   of "onconflict":
+    when dbBackend == DbBackend.mysql:
+      macros.error "MySQL/MariaDB do not support targeted ON CONFLICT; ON DUPLICATE KEY has different semantics", n
     if q.kind notin {qkInsert, qkInsertReturning}:
       macros.error "'onconflict' only possible within 'insert'", n
     if q.onConflictTargetSet:
@@ -1322,12 +1358,21 @@ proc queryh(n: NimNode; q: QueryBuilder) =
     when dbBackend == DbBackend.sqlite:
       q.returning = ";\nselect last_insert_rowid()"
     elif dbBackend == DbBackend.mysql:
-      q.returning = ";\nselect LAST_INSERT_ID()"
+      q.returning = "insert-id"
     else:
       q.returning = " returning "
     var colname = ""
     let nimType = toNimType lookupColumnInEnv(n[1], colname, q.params, DbType(kind: dbUnknown), q)
+    colname = nodeName(n[1])
     q.singleRow = true
+    when dbBackend == DbBackend.mysql:
+      var autoKey = false
+      for a in attributes:
+        when compiles(a.autoIncrement):
+          if a.tabIndex == q.env[0][0] and cmpIgnoreCase(a.name, colname) == 0:
+            autoKey = a.autoIncrement
+      if not autoKey:
+        macros.error "MySQL/MariaDB returning requires an AUTO_INCREMENT column", n
     when dbBackend != DbBackend.sqlite:
       q.retType.add newIdentDefs(ident(colname), nimType)
       q.retNames.add colname
@@ -1403,9 +1448,11 @@ proc queryAsString(q: QueryBuilder, n: NimNode): string =
     result.add "\Llimit "
     result.add q.limit
   if q.offset.len > 0:
+    when dbBackend == DbBackend.mysql:
+      if q.limit.len == 0: result.add "\Llimit 18446744073709551615"
     result.add "\Loffset "
     result.add q.offset
-  when dbBackend != DbBackend.sqlite:
+  when dbBackend == DbBackend.postgre:
     if q.returning.len > 0:
       result.add q.returning
   when defined(debugOrminSql):
@@ -1713,7 +1760,10 @@ proc queryImpl(q: QueryBuilder; body: NimNode; attempt, produceJson: bool): NimN
     insertedId
 
   let returnsData = q.kind in {qkSelect, qkJoin, qkInsertReturning}
-  if not q.singleRow and q.retType.len > 0:
+  if dbBackend == DbBackend.mysql and q.kind == qkInsertReturning:
+    blk.add getAst(ifStmt2(prepStmt, false, newStmtList()))
+    blk.add newCall(ident"bindInsertId", ident"db", prepStmt, res, newLit(q.retNames[0]))
+  elif not q.singleRow and q.retType.len > 0:
     blk.add getAst(whileStmt(prepStmt, res, it, body))
   elif dbBackend == DbBackend.sqlite and q.kind == qkInsertReturning and q.retExpr.kind != nnkEmpty:
     # For SQLite, emulate RETURNING by returning the inserted expression value.
@@ -1855,6 +1905,22 @@ macro tryQuery*(args: varargs[untyped]): untyped =
 
 # Transaction state for nested transactions
 var txDepth {.threadvar.}: int
+var txDepthByConnection {.threadvar.}: Table[pointer, int]
+
+proc connectionTxDepth(db: auto): int =
+  txDepthByConnection.getOrDefault(cast[pointer](db))
+
+proc incConnectionTxDepth(db: auto) =
+  let key = cast[pointer](db)
+  txDepthByConnection[key] = txDepthByConnection.getOrDefault(key) + 1
+  inc txDepth
+
+proc decConnectionTxDepth(db: auto) =
+  let key = cast[pointer](db)
+  let depth = txDepthByConnection[key] - 1
+  if depth == 0: txDepthByConnection.del(key)
+  else: txDepthByConnection[key] = depth
+  dec txDepth
 
 proc getTxDepth*(): int = 
   result = txDepth
@@ -1869,29 +1935,33 @@ proc decTxDepth*() =
   dec txDepth
 
 template txBegin*(sp: untyped) =
-  if isTopTx():
-    execNoRowsLoose("begin transaction")
+  if connectionTxDepth(db) == 1:
+    when dbBackend == DbBackend.mysql:
+      execNoRowsLoose("start transaction")
+    else:
+      execNoRowsLoose("begin transaction")
   else:
     execNoRowsLoose("savepoint " & sp)
 
 template txCommit*(sp: untyped) =
-  if isTopTx():
+  if connectionTxDepth(db) == 1:
     execNoRowsLoose("commit")
   else:
     execNoRowsLoose("release savepoint " & sp)
 
 template txRollback*(sp: untyped) =
-  if isTopTx():
+  if connectionTxDepth(db) == 1:
     execNoRowsLoose("rollback")
   else:
     execNoRowsLoose("rollback to savepoint " & sp)
+    execNoRowsLoose("release savepoint " & sp)
 
 template transaction*(body: untyped) =
   ## Runs the body inside a database transaction. Commits on success,
   ## rolls back on any exception and rethrows. Supports nesting via savepoints.
   block:
-    incTxDepth()
-    let sp = "ormin_tx_" & $txDepth
+    incConnectionTxDepth(db)
+    let sp = "ormin_tx_" & $connectionTxDepth(db)
 
     try:
       txBegin(sp)
@@ -1904,7 +1974,7 @@ template transaction*(body: untyped) =
       txRollback(sp)
       raise
     finally:
-      decTxDepth()
+      decConnectionTxDepth(db)
 
 macro getBlock(blk: untyped): untyped =
   result = blk[0]
@@ -1913,8 +1983,8 @@ template transaction*(body, other: untyped) =
   ## Runs the body inside a database transaction. Commits on success,
   ## rolls back on any exception and rethrows. Supports nesting via savepoints.
   block:
-    incTxDepth()
-    let sp = "ormin_tx_" & $txDepth
+    incConnectionTxDepth(db)
+    let sp = "ormin_tx_" & $connectionTxDepth(db)
 
     try:
       txBegin(sp)
@@ -1927,7 +1997,18 @@ template transaction*(body, other: untyped) =
       txRollback(sp)
       raise
     finally:
-      decTxDepth()
+      decConnectionTxDepth(db)
+
+template tryTransaction*(body: untyped): bool =
+  block:
+    var succeeded = false
+    try:
+      transaction:
+        body
+      succeeded = true
+    except DbError:
+      discard
+    succeeded
 
 proc createRoutine(name, query: NimNode; k: NimNodeKind): NimNode =
   expectKind query, nnkStmtList

@@ -15,6 +15,7 @@ type
     typ: DbTypekind
     typeName: string
     validValues: seq[string]
+    autoIncrement: bool
     key: int   # 0 nothing special,
                # +1 -- primary key
                # -N -- references attribute N
@@ -26,6 +27,7 @@ type
     tableName*: string
     typ*: DbType
     primaryKey*: bool
+    autoIncrement*: bool
     refs*: (string, string)
   DbColumns* = seq[DbColumn]
 
@@ -98,17 +100,24 @@ proc collectTables*(n: SqlNode; t: var KnownTables; enums: KnownEnums) =
       let it = n[i]
       if it.kind == nkColumnDef:
         var typ = getType(it[1], enums)
+        if hasAttribute(it, {nkUnsigned}): typ.kind = dbUInt
         if hasAttribute(it, {nkNotNull}):
           typ.notNull = true
         cols.add DbColumn(
           name: it[0].strVal,
           tableName: tableName,
           typ: typ,
-          primaryKey: hasAttribute(it, {nkPrimaryKey}),
+           primaryKey: hasAttribute(it, {nkPrimaryKey}),
+           autoIncrement: hasAttribute(it, {nkAutoIncrement}) or typ.kind == dbSerial,
           refs: hasRefs(it)
         )
     for i in 1 ..< n.len:
       let it = n[i]
+      if it.kind == nkPrimaryKey:
+        for key in it.sons:
+          for col in mitems(cols):
+            if cmpIgnoreCase(col.name, sqlIdentBaseName(key)) == 0:
+              col.primaryKey = true
       if it.kind == nkForeignKey:
         var refNode: SqlNode = nil
         var localCols: seq[string] = @[]
@@ -116,7 +125,7 @@ proc collectTables*(n: SqlNode; t: var KnownTables; enums: KnownEnums) =
           let child = it[j]
           if child.kind == nkReferences:
             refNode = child
-          elif child.kind == nkIdent:
+          elif child.kind in {nkIdent, nkQuotedIdent}:
             localCols.add(child.strVal)
         if refNode.isNil:
           continue
@@ -181,7 +190,6 @@ proc addStringSeq(dest: var string; values: openArray[string]) =
   dest.add "]"
 
 proc renderModelCode(schemaSql, schemaPath: string; target: ImportTarget; includeStatic = false): string =
-  discard target
   let sql = parseSql(schemaSql, schemaPath)
   let enums = collectEnumTypes(schemaSql)
   var knownTables = initOrderedTable[string, DbColumns]()
@@ -195,7 +203,7 @@ proc renderModelCode(schemaSql, schemaPath: string; target: ImportTarget; includ
       result.add ",\n  "
     else:
       result.add "\n  "
-    result.add escape(k.toLowerAscii)
+    result.add escape(if target == mysql: k else: k.toLowerAscii)
     inc i
   result.add "\n]\n"
 
@@ -209,7 +217,7 @@ proc renderModelCode(schemaSql, schemaPath: string; target: ImportTarget; includ
       else:
         result.add "\n  "
       result.add "Attr(name: "
-      result.add escape(a.name.toLowerAscii)
+      result.add escape(if target == mysql: a.name else: a.name.toLowerAscii)
       result.add ", tabIndex: "
       result.add $i
       result.add ", typ: "
@@ -220,6 +228,8 @@ proc renderModelCode(schemaSql, schemaPath: string; target: ImportTarget; includ
       result.addStringSeq(a.typ.validValues)
       result.add ", key: "
       result.add $attrToKey(a, knownTables)
+      result.add ", autoIncrement: "
+      result.add $a.autoIncrement
       result.add ")"
       inc j
     inc i

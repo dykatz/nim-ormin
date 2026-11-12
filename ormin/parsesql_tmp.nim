@@ -532,6 +532,8 @@ type
     nkEnumDef,
     nkPragma,
     nkAutoIncrement,
+    nkUnsigned,
+    nkTableOptions,
     nkOnDelete,
     nkOnUpdate,
     nkDeferrable,
@@ -1002,8 +1004,7 @@ proc parseParIdentList(p: var SqlParser, father: SqlNode) =
   eat(p, tkParLe)
   while true:
     expectIdent(p)
-    father.add(newNode(nkIdent, p.tok.literal))
-    getTok(p)
+    father.add(parseIdentNode(p))
     if p.tok.kind != tkComma: break
     getTok(p)
   eat(p, tkParRi)
@@ -1143,9 +1144,14 @@ proc parseColumnConstraints(p: var SqlParser, result: SqlNode) =
     elif isKeyw(p, "unique"):
       getTok(p)
       result.add(newNode(nkUnique))
-    elif isKeyw(p, "autoincrement"):
+    elif isKeyw(p, "autoincrement") or isKeyw(p, "auto_increment"):
       getTok(p)
       result.add(newNode(nkAutoIncrement))
+    elif isKeyw(p, "unsigned"):
+      getTok(p)
+      result.add(newNode(nkUnsigned))
+    elif isKeyw(p, "signed"):
+      getTok(p)
     elif isKeyw(p, "collate"):
       getTok(p)
       # collate <name>
@@ -1162,8 +1168,7 @@ proc parseColumnConstraints(p: var SqlParser, result: SqlNode) =
 proc parseColumnDef(p: var SqlParser): SqlNode =
   expectIdent(p)
   result = newNode(nkColumnDef)
-  result.add(newNode(nkIdent, p.tok.literal))
-  getTok(p)
+  result.add(parseIdentNode(p))
   result.add(parseDataType(p))
   parseColumnConstraints(p, result)
 
@@ -1272,18 +1277,27 @@ proc parseTableConstraint(p: var SqlParser): SqlNode =
   elif isKeyw(p, "unique"):
     getTok(p)
     optKeyw(p, "key")
-    result = newNode(nkUnique)
-    parseParIdentList(p, result)
+    optKeyw(p, "index")
+    if p.tok.kind in {tkIdentifier, tkQuotedIdentifier}:
+      let name = p.tok.literal
+      getTok(p)
+      result = newNode(nkRaw, "unique key `" & name.replace("`", "``") & "` " & readBalancedSql(p))
+    else:
+      result = newNode(nkUnique)
+      parseParIdentList(p, result)
+  elif isKeyw(p, "key") or isKeyw(p, "index"):
+    getTok(p)
+    var name = ""
+    if p.tok.kind in {tkIdentifier, tkQuotedIdentifier}:
+      name = " `" & p.tok.literal.replace("`", "``") & "`"
+      getTok(p)
+    result = newNode(nkRaw, "key" & name & " " & readBalancedSql(p))
   elif isKeyw(p, "check"):
     result = parseCheck(p)
   elif isKeyw(p, "constraint"):
     result = parseConstraint(p)
   else:
     sqlError(p, "column definition expected")
-
-proc parseUnique(p: var SqlParser): SqlNode =
-  result = parseExpr(p)
-  if result.kind == nkCall: result.kind = nkUnique
 
 proc parseTableDef(p: var SqlParser): SqlNode =
   result = parseIfNotExists(p, nkCreateTable)
@@ -1293,10 +1307,9 @@ proc parseTableDef(p: var SqlParser): SqlNode =
     while p.tok.kind != tkParRi:
       if isKeyw(p, "constraint"):
         result.add parseConstraint(p)
-      elif isKeyw(p, "primary") or isKeyw(p, "foreign"):
+      elif isKeyw(p, "primary") or isKeyw(p, "foreign") or
+           isKeyw(p, "unique") or isKeyw(p, "key") or isKeyw(p, "index"):
         result.add parseTableConstraint(p)
-      elif isKeyw(p, "unique"):
-        result.add parseUnique(p)
       elif p.tok.kind == tkIdentifier or p.tok.kind == tkQuotedIdentifier:
         result.add(parseColumnDef(p))
       else:
@@ -1304,9 +1317,19 @@ proc parseTableDef(p: var SqlParser): SqlNode =
       if p.tok.kind != tkComma: break
       getTok(p)
     eat(p, tkParRi)
-    # skip additional crap after 'create table (...) crap;'
+    # Preserve table options: dropping ENGINE/charset changes schema semantics.
+    var options = newNode(nkTableOptions)
     while p.tok.kind notin {tkSemicolon, tkEof}:
+      let token = p.tok
+      case token.kind
+      of tkStringConstant:
+        options.add(newNode(nkStringLit, token.literal))
+      of tkQuotedIdentifier:
+        options.add(newNode(nkQuotedIdent, token.literal))
+      else:
+        options.add(newNode(nkRaw, if token.kind >= tkSemicolon: tokKindToStr[token.kind] else: token.literal))
       getTok(p)
+    if options.len > 0: result.add(options)
 
 proc parseTypeDef(p: var SqlParser): SqlNode =
   result = parseIfNotExists(p, nkCreateType)
@@ -1636,6 +1659,7 @@ type
   SqlWriter = object
     indent: int
     upperCase: bool
+    mysql: bool
     buffer: string
 
 proc add(s: var SqlWriter, thing: char) =
@@ -1709,7 +1733,7 @@ proc ra(n: SqlNode, s: var SqlWriter) =
     else:
       s.add(quoted(n.strVal))
   of nkQuotedIdent:
-    s.add(quoted(n.strVal))
+    s.add(if s.mysql: "`" & n.strVal.replace("`", "``") & "`" else: quoted(n.strVal))
   of nkStringLit:
     s.prepareAdd
     s.buffer.escape(n.strVal)
@@ -1780,7 +1804,11 @@ proc ra(n: SqlNode, s: var SqlWriter) =
     s.addKeyw("default")
     ra(n.sons[0], s)
   of nkAutoIncrement:
-    s.addKeyw("autoincrement")
+    s.addKeyw(if s.mysql: "auto_increment" else: "autoincrement")
+  of nkUnsigned:
+    s.addKeyw("unsigned")
+  of nkTableOptions:
+    rs(n, s, "", "", " ")
   of nkCheck:
     s.addKeyw("check")
     ra(n.sons[0], s)
@@ -1948,10 +1976,16 @@ proc ra(n: SqlNode, s: var SqlWriter) =
       s.addKeyw("if not exists")
     ra(n.sons[0], s)
     s.add('(')
+    var columnCount = 0
     for i in 1..n.len-1:
-      if i > 1: s.add(',')
+      if n.sons[i].kind == nkTableOptions: continue
+      if columnCount > 0: s.add(',')
       ra(n.sons[i], s)
-    s.add(");")
+      inc columnCount
+    s.add(')')
+    for child in n.sons:
+      if child.kind == nkTableOptions: ra(child, s)
+    s.add(';')
   of nkCreateType, nkCreateTypeIfNotExists:
     s.addKeyw("create type")
     if n.kind == nkCreateTypeIfNotExists:
@@ -1987,9 +2021,9 @@ proc ra(n: SqlNode, s: var SqlWriter) =
         s.add(" = ")
         ra(n.sons[1], s)
 
-proc renderSql*(n: SqlNode, upperCase = false): string =
+proc renderSql*(n: SqlNode, upperCase = false, mysql = false): string =
   ## Converts an SQL abstract syntax tree to its string representation.
-  var s = SqlWriter(buffer: "", upperCase: upperCase)
+  var s = SqlWriter(buffer: "", upperCase: upperCase, mysql: mysql)
   ra(n, s)
   return s.buffer
 

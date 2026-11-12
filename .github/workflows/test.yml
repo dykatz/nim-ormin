@@ -63,3 +63,48 @@ jobs:
 
     - name: Build examples
       run: nim buildexamples
+
+  mysql:
+    runs-on: ubuntu-latest
+    strategy:
+      matrix:
+        include:
+          - server: mysql:8.4
+            client: default-libmysqlclient-dev
+            health: mysqladmin ping -h 127.0.0.1 -ptest
+          - server: mariadb:11.4
+            client: libmariadb-dev-compat
+            health: mariadb-admin ping -h 127.0.0.1 -ptest
+    name: Test ${{ matrix.server }}
+    services:
+      mysql:
+        image: ${{ matrix.server }}
+        env:
+          MYSQL_ROOT_PASSWORD: test
+          MYSQL_DATABASE: ormin_test
+          MYSQL_USER: ormin_test
+          MYSQL_PASSWORD: test
+        ports:
+          - 3306:3306
+        options: >-
+          --health-cmd="${{ matrix.health }}"
+          --health-interval=10s
+          --health-timeout=5s
+          --health-retries=10
+    steps:
+      - uses: actions/checkout@v4
+      - uses: jiro4989/setup-nim-action@v2
+        with:
+          nim-version: stable
+      - name: Install client development headers
+        run: sudo apt-get update && sudo apt-get install -y ${{ matrix.client }}
+      - name: Install Nim dependencies
+        run: nimble install -y --depsOnly
+      - name: Run MySQL/MariaDB tests
+        run: nim test_mysql
+        env:
+          MYSQL_HOST: 127.0.0.1
+          MYSQL_PORT: 3306
+          MYSQL_DATABASE: ormin_test
+          MYSQL_USER: ormin_test
+          MYSQL_PASSWORD: test

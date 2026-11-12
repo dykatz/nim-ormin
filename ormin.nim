@@ -8,7 +8,7 @@ from ormin/importer_core import generateModelCode, ImportTarget
 
 template importModel*(backend: DbBackend, filename: string, includeStatic: static[bool] = false) {.dirty.} =
   ## imports a model from an SQL file.
-  bind fileExists, parentDir, `/`
+  bind fileExists, parentDir, `/`, quoteShell
   bind generateModelCode, ImportTarget
   const file = static:
     let path = parentDir(instantiationInfo(-1, true)[0])
@@ -17,10 +17,10 @@ template importModel*(backend: DbBackend, filename: string, includeStatic: stati
     if not includeStatic:
       let res =
         if fileExists("./tools/ormin_importer"):
-          gorgeEx("./tools/ormin_importer " & file)
+           gorgeEx("./tools/ormin_importer --db:" & $backend & " " & quoteShell(file))
         else:
           # run ormin_importer from the PATH
-          gorgeEx("ormin_importer " & file)
+           gorgeEx("ormin_importer --db:" & $backend & " " & quoteShell(file))
       if res.exitCode != 0:
         raise newException(Exception, "Failed to generate model: " & res.output)
     file

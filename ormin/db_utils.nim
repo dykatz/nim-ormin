@@ -2,13 +2,14 @@ import std/[os, paths]
 import db_connector/db_common, strutils, strformat
 import db_connector/db_postgres as db_postgres
 import db_connector/db_sqlite as db_sqlite
+from db_connector/db_mysql import nil
 
 import parsesql_tmp # import std/parsesql
 
 export paths
 
 type
-  DbConn = db_postgres.DbConn | db_sqlite.DbConn
+  DbConn = db_postgres.DbConn | db_sqlite.DbConn | db_mysql.DbConn
   DbId* = distinct string
   DbSql* = distinct string
 
@@ -75,35 +76,44 @@ proc canUseBareIdentifier(part: string): bool =
       return false
   true
 
-proc quoteDbIdentifier*(name: string): DbId =
+proc quoteDbIdentifier*(name: string; mysql = false): DbId =
   ## Quote a database identifier for direct interpolation into SQL text.
   ## Dot-separated names are treated as qualified identifiers.
   var partsSql: seq[string] = @[]
   for (part, wasQuoted) in parseQualifiedIdentifier(name):
-    let normalizedPart = if wasQuoted: part else: part.toLowerAscii()
-    if wasQuoted or not canUseBareIdentifier(normalizedPart):
+    let normalizedPart = if wasQuoted or mysql: part else: part.toLowerAscii()
+    if mysql:
+      partsSql.add("`" & normalizedPart.replace("`", "``") & "`")
+    elif wasQuoted or not canUseBareIdentifier(normalizedPart):
       partsSql.add("\"" & normalizedPart.replace("\"", "\"\"") & "\"")
     else:
       partsSql.add(normalizedPart)
   DbId(partsSql.join("."))
 
+template execSchema(db: typed; statement: string) =
+  when db is db_mysql.DbConn:
+    mixin execMysql
+    execMysql(db, statement)
+  else:
+    db.exec(sql(statement))
+
 proc dropTableName(db: DbConn; tableName, lookupName: string) =
   # SQL parameters bind values, not identifiers, so DROP TABLE needs the
   # identifier rendered into the statement text with correct quoting.
   when defined(sqlite) and defined(orminLegacySqliteDropNames):
-    db.exec(sql("drop table if exists " & lookupName))
+    execSchema(db, "drop table if exists " & lookupName)
   else:
-    let tableIdentSql = quoteDbIdentifier(tableName)
-    when defined(postgre):
-      db.exec(sql("drop table if exists " & $tableIdentSql & " cascade"))
+    let tableIdentSql = quoteDbIdentifier(tableName, db is db_mysql.DbConn)
+    when db is db_postgres.DbConn:
+      execSchema(db, "drop table if exists " & $tableIdentSql & " cascade")
     else:
-      db.exec(sql("drop table if exists " & $tableIdentSql))
+      execSchema(db, "drop table if exists " & $tableIdentSql)
 
-iterator tableDefs(sql: DbSql): tuple[name, tableName, model: string] =
+iterator tableDefs(sql: DbSql; mysql = false): tuple[name, tableName, model: string] =
   # Parse the entire SQL file and iterate statements via the SQL parser
   var ast: SqlNode
   try:
-    ast = parseSql($sql)
+    ast = parseSql($sql, considerTypeParams = true)
   except SqlParseError as e:
     echo "SQL Parse Error:\n", sql
     raise e
@@ -113,12 +123,12 @@ iterator tableDefs(sql: DbSql): tuple[name, tableName, model: string] =
     for i in 0 ..< ast.len:
       let node = ast[i]
       if node.kind in {nkCreateTable, nkCreateTableIfNotExists}:
-        yield (sqlIdentBaseName(node[0]).toLowerAscii(), sqlIdentName(node[0]), $node)
+        yield (sqlIdentBaseName(node[0]).toLowerAscii(), sqlIdentName(node[0]), renderSql(node, mysql = mysql))
   else:
     # Fallback: ast might be a single statement (not a list)
     let node = ast
     if node.kind in {nkCreateTable, nkCreateTableIfNotExists}:
-      yield (sqlIdentBaseName(node[0]).toLowerAscii(), sqlIdentName(node[0]), $node)
+      yield (sqlIdentBaseName(node[0]).toLowerAscii(), sqlIdentName(node[0]), renderSql(node, mysql = mysql))
 
 iterator tablePairs*(sql: string): tuple[name, model: string] =
   for name, _, model in tableDefs(DbSql(sql)):
@@ -135,30 +145,41 @@ iterator tablePairs*(sql: Path): tuple[name, model: string] =
     yield (n, m)
 
 proc createTable*(db: DbConn; sqlFile: Path) =
-  for _, m in tablePairs(sqlFile):
-    db.exec(sql(m))
+  for _, _, m in tableDefs(DbSql(readFile($sqlFile)), db is db_mysql.DbConn):
+    execSchema(db, m)
 
 proc createTable*(db: DbConn; sqlFile: Path, name: string) =
-  for n, m in tablePairs(sqlFile):
+  for n, _, m in tableDefs(DbSql(readFile($sqlFile)), db is db_mysql.DbConn):
     if n == name:
-      db.exec(sql(m))
+      execSchema(db, m)
       return
   raiseAssert &"table: {name} not found in: {sqlFile}"
 
 proc createTable*(db: DbConn; schemaSql: static[DbSql]) =
-  for _, m in tablePairs(schemaSql):
-    db.exec(sql(m))
+  for _, _, m in tableDefs(schemaSql, db is db_mysql.DbConn):
+    execSchema(db, m)
 
 proc createTable*(db: DbConn; schemaSql: static[DbSql], name: string) =
-  for n, m in tablePairs(schemaSql):
+  for n, _, m in tableDefs(schemaSql, db is db_mysql.DbConn):
     if n == name:
-      db.exec(sql(m))
+      execSchema(db, m)
       return
   raiseAssert &"table: {name} not found in static schema"
 
+proc dropTables(db: DbConn; schemaSql: DbSql) =
+  when db is db_mysql.DbConn:
+    # Schemas create referenced tables first; remove dependents first.
+    var names: seq[(string, string)]
+    for lookupName, tableName, _ in tableDefs(schemaSql):
+      names.add((lookupName, tableName))
+    for i in countdown(names.high, 0):
+      db.dropTableName(names[i][1], names[i][0])
+  else:
+    for lookupName, tableName, _ in tableDefs(schemaSql):
+      db.dropTableName(tableName, lookupName)
+
 proc dropTable*(db: DbConn; sqlFile: Path) =
-  for lookupName, tableName, _ in tableDefs(DbSql(readFile($sqlFile))):
-    db.dropTableName(tableName, lookupName)
+  dropTables(db, DbSql(readFile($sqlFile)))
 
 proc dropTable*(db: DbConn; sqlFile: Path, name: string) =
   for lookupName, tableName, _ in tableDefs(DbSql(readFile($sqlFile))):
@@ -168,8 +189,7 @@ proc dropTable*(db: DbConn; sqlFile: Path, name: string) =
   raiseAssert &"table: {name} not found in: {sqlFile}"
 
 proc dropTable*(db: DbConn; schemaSql: static[DbSql]) =
-  for lookupName, tableName, _ in tableDefs(schemaSql):
-    db.dropTableName(tableName, lookupName)
+  dropTables(db, schemaSql)
 
 proc dropTable*(db: DbConn; schemaSql: static[DbSql], name: string) =
   for lookupName, tableName, _ in tableDefs(schemaSql):

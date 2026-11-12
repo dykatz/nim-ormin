@@ -47,3 +47,7 @@ task buildexamples, "Build examples: chat and forum":
   selfExec "c examples/forum/forum"
   selfExec "c examples/forum/forumproto"
   selfExec "c examples/tweeter/src/tweeter"
+
+task test_mysql, "Run MySQL/MariaDB tests against disposable ormin_test":
+  buildimporterTask()
+  exec "python3 tools/test_mysql.py"
