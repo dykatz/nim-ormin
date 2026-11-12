@@ -44,6 +44,7 @@ proc ormin_mysql_open(host, user, password, database: cstring; port: cuint; sock
 proc ormin_mysql_error(db: DbConn): cstring
 proc ormin_mysql_close(db: DbConn)
 proc ormin_mysql_charset(db: DbConn): cint
+proc ormin_mysql_transaction(db: DbConn; sql: cstring; length: culong): cint
 proc ormin_mysql_prepare(db: DbConn; sql: cstring; length: culong): PStmt
 proc ormin_mysql_stmt_error(s: PStmt): cstring
 proc ormin_mysql_finalize(s: PStmt)
@@ -64,6 +65,13 @@ proc dbError*(db: DbConn) {.noreturn.} =
 proc stmtError(s: PStmt) {.noreturn.} =
   let detail = $ormin_mysql_stmt_error(s)
   raise newException(DbError, if detail.len == 0: "MySQL statement or buffer allocation failed" else: detail)
+
+proc execMysqlTransaction*(db: DbConn; statement: string) =
+  ## Internal transaction-control path. Unlike queries, these commands must
+  ## use the text protocol on MySQL. Never interpolate application values.
+  when defined(debugOrminTrace): echo "[[Ormin Executing]]: ", statement
+  if ormin_mysql_transaction(db, statement.cstring, statement.len.culong) != 0:
+    dbError(db)
 
 proc close*(db: DbConn) =
   if cast[pointer](db) != nil: ormin_mysql_close(db)

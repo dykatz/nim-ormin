@@ -7,12 +7,14 @@ doAssert getEnv("MYSQL_DATABASE") == "ormin_test", "Only the disposable ormin_te
 let connection = getEnv("MYSQL_SOCKET", getEnv("MYSQL_HOST", "127.0.0.1") & ":" & getEnv("MYSQL_PORT", "3306"))
 let db = open(connection, getEnv("MYSQL_USER"), getEnv("MYSQL_PASSWORD"), "ormin_test")
 
-proc statementCount(db: DbConn): int64 =
-  let s = prepareStmt(db, "SHOW SESSION STATUS LIKE 'Prepared_stmt_count'")
+proc sessionStatus(db: DbConn; name: string): int64 =
+  let s = prepareStmt(db, "SHOW SESSION STATUS LIKE '" & name & "'")
   defer: finalizeStmt(s)
   startQuery(db, s)
   doAssert stepQuery(db, s, true)
   bindResult(db, s, 1, result, int64, "count")
+
+proc statementCount(db: DbConn): int64 = sessionStatus(db, "Prepared_stmt_count")
 
 proc isolatedTransaction(db: DbConn) =
   transaction:
@@ -167,6 +169,20 @@ try:
       check db.getValue(sql"SELECT COUNT(*) FROM ormin_mysql_types WHERE info IS NOT NULL AND JSON_TYPE(info)='NULL'") == "1"
       query:
         delete ormin_mysql_types
+
+    test "transaction control does not use the prepared-statement protocol":
+      let before = sessionStatus(db, "Com_stmt_prepare")
+      transaction:
+        transaction:
+          discard
+        expect ValueError:
+          transaction:
+            raise newException(ValueError, "rollback to savepoint")
+      expect ValueError:
+        transaction:
+          raise newException(ValueError, "rollback transaction")
+      # Only this status query itself should prepare a statement.
+      check sessionStatus(db, "Com_stmt_prepare") == before + 1
 
     test "transactions and nested savepoints":
       transaction:

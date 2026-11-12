@@ -27,6 +27,11 @@ static int ormin_mysql_charset(void *db) {
   if (mysql_set_character_set((MYSQL *)db, "utf8mb4")) return 1;
   return mysql_query((MYSQL *)db, "SET time_zone = '+00:00'");
 }
+/* MySQL does not prepare every transaction-control command (notably
+ * savepoint operations). These contain only library-generated SQL, no values. */
+static int ormin_mysql_transaction(void *db, const char *sql, unsigned long len) {
+  return mysql_real_query((MYSQL *)db, sql, len);
+}
 static void *ormin_mysql_prepare(void *db, const char *sql, unsigned long len) {
   ormin_mysql_statement *s = (ormin_mysql_statement *)calloc(1, sizeof(*s));
   if (!s) return NULL;

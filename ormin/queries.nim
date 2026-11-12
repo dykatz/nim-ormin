@@ -1934,27 +1934,33 @@ proc incTxDepth*() =
 proc decTxDepth*() = 
   dec txDepth
 
+template execTransactionControl(statement: string) =
+  when dbBackend == DbBackend.mysql:
+    execMysqlTransaction(db, statement)
+  else:
+    execNoRowsLoose(statement)
+
 template txBegin*(sp: untyped) =
   if connectionTxDepth(db) == 1:
     when dbBackend == DbBackend.mysql:
-      execNoRowsLoose("start transaction")
+      execTransactionControl("start transaction")
     else:
-      execNoRowsLoose("begin transaction")
+      execTransactionControl("begin transaction")
   else:
-    execNoRowsLoose("savepoint " & sp)
+    execTransactionControl("savepoint " & sp)
 
 template txCommit*(sp: untyped) =
   if connectionTxDepth(db) == 1:
-    execNoRowsLoose("commit")
+    execTransactionControl("commit")
   else:
-    execNoRowsLoose("release savepoint " & sp)
+    execTransactionControl("release savepoint " & sp)
 
 template txRollback*(sp: untyped) =
   if connectionTxDepth(db) == 1:
-    execNoRowsLoose("rollback")
+    execTransactionControl("rollback")
   else:
-    execNoRowsLoose("rollback to savepoint " & sp)
-    execNoRowsLoose("release savepoint " & sp)
+    execTransactionControl("rollback to savepoint " & sp)
+    execTransactionControl("release savepoint " & sp)
 
 template transaction*(body: untyped) =
   ## Runs the body inside a database transaction. Commits on success,
