@@ -108,7 +108,9 @@ MySQL-specific behavior:
 
 Transactions and nested savepoints require InnoDB (or another transactional engine). DDL can implicitly commit and must not be assumed to roll back. Transaction nesting is tracked separately for each connection on each thread; do not share an active connection across threads.
 
-The backend exports `exec(db, sql"...")` and `getValue(db, sql"...")` for single, unparameterized SQL statements. Prefer the query DSL for runtime values. `DbConn` is compatible with `db_connector/db_mysql`, but that module's separate dynamic loader may require additional library-path configuration on some systems.
+The backend uses `db_connector/db_mysql` for native prepared statements and connection management; no separate Ormin C shim is needed. It exports `exec(db, sql"...")` and `getValue(db, sql"...")` for single, unparameterized SQL statements. Prefer the query DSL for runtime values. `DbConn` is compatible with `db_connector/db_mysql`. Transaction control and schema utilities use its text-protocol API.
+
+The Nimble dependency temporarily points to `dykatz/nim-db_connector#mysql-support` while the MySQL driver changes are developed. Restore the upstream dependency (with a version containing the native prepared API) before submitting an Ormin PR.
 
 ## Query DSL
 

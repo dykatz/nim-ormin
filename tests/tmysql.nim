@@ -1,6 +1,7 @@
 import std/[unittest, os, json, times, options, strutils]
 import ormin
 import ormin/query_hooks
+from db_connector/db_mysql import nil
 importModel(DbBackend.mysql, "model_mysql", includeStatic = true)
 
 doAssert getEnv("MYSQL_DATABASE") == "ormin_test", "Only the disposable ormin_test database is allowed"
@@ -273,6 +274,22 @@ try:
         bindResult(db, s, 0, value, string, "value")
         check value == text
         stopQuery(db, s)
+
+    test "db_connector and Ormin share a connection without losing NULLs or bytes":
+      check db_mysql.getRow(db, sql"SELECT x'010002', NULL, ''") == @["\x01\0\x02", "", ""]
+      let s = prepareStmt(db, "SELECT ?, NULL, '' LIMIT ?")
+      defer: finalizeStmt(s)
+      bindParam(db, s, 1, "a\0b", string)
+      bindParam(db, s, 2, 1, int)
+      startQuery(db, s)
+      check stepQuery(db, s, true)
+      var value: string
+      bindResult(db, s, 0, value, string, "value")
+      check value == "a\0b"
+      check columnIsNull(db, s, 1)
+      check not columnIsNull(db, s, 2)
+      check not stepQuery(db, s, true)
+      check db_mysql.getValue(db, sql"SELECT 1") == "1"
 
     test "errors, hooks and repeated executions do not poison the connection":
       let before = statementCount(db)

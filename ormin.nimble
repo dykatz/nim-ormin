@@ -6,11 +6,12 @@ description = "Prepared SQL statement generator. A lightweight ORM."
 license       = "MIT"
 bin = @["tools/ormin_importer"]
 skipDirs = @["examples"]
-installExt = @["nim", "h"]
+installExt = @["nim"]
 
 # Dependencies
 requires "nim >= 2.0.0"
-requires "db_connector >= 0.1.0"
+# TEMPORARY: restore the upstream dependency before opening a PR.
+requires "https://github.com/dykatz/nim-db_connector#mysql-support"
 
 feature "examples":
   requires "websocket >= 0.2.2"
